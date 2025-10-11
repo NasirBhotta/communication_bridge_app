@@ -1,5 +1,8 @@
 package com.example.btbridge;
 
+import android.content.ComponentName;
+import android.graphics.Color;
+import android.media.AudioManager;
 import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -30,6 +33,8 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.ParcelUuid;
+import android.telecom.PhoneAccount;
+import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
 import android.util.Log;
 
@@ -64,6 +69,8 @@ public class BluetoothServerService extends Service {
     private BluetoothGattServerCallback gattServerCallback;
     private BroadcastReceiver bluetoothStateReceiver;
 
+    private AudioManager audioManager;
+    private boolean isScoStarted = false;
     public static final UUID SERVICE_UUID = UUID.fromString("a8b345a3-f547-4cfc-a843-8583487cb6e0");
     public static final UUID COMMAND_CHAR_UUID = UUID.fromString("a8b345a3-f547-4cfc-a843-8583487cb6e1");
 
@@ -106,14 +113,26 @@ public class BluetoothServerService extends Service {
             return;
         }
 
+        // Initialize AudioManager for Bluetooth SCO routing
+        audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audioManager == null) {
+            Log.e(TAG, "FATAL: AudioManager not available!");
+        } else {
+            Log.i(TAG, "AudioManager initialized successfully");
+        }
+
         // Register Bluetooth state receiver
         registerBluetoothStateReceiver();
 
         // Initialize callbacks
         initializeCallbacks();
 
+        testSCOAudioRouting();
+        registerPhoneAccount();
+
         Log.i(TAG, "Service onCreate completed successfully");
     }
+
 
     private void registerBluetoothStateReceiver() {
         bluetoothStateReceiver = new BroadcastReceiver() {
@@ -394,6 +413,58 @@ public class BluetoothServerService extends Service {
         }
     }
 
+
+    /**
+     * Starts routing audio through Bluetooth SCO
+     */
+    private void startBluetoothScoAudio() {
+        if (audioManager == null) {
+            Log.e(TAG, "AudioManager is null, cannot start SCO");
+            return;
+        }
+
+        if (!audioManager.isBluetoothScoAvailableOffCall()) {
+            Log.e(TAG, "Bluetooth SCO not available on this device!");
+            return;
+        }
+
+        if (isScoStarted) {
+            Log.w(TAG, "SCO already started, ignoring request");
+            return;
+        }
+
+        try {
+            Log.i(TAG, "🔊 Starting Bluetooth SCO...");
+            audioManager.startBluetoothSco();
+            audioManager.setBluetoothScoOn(true);
+            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+            isScoStarted = true;
+            Log.i(TAG, "✓ SCO audio routing started");
+        } catch (Exception e) {
+            Log.e(TAG, "Error starting Bluetooth SCO", e);
+        }
+    }
+
+    /**
+     * Stops Bluetooth SCO audio routing
+     */
+    private void stopBluetoothScoAudio() {
+        if (audioManager == null) return;
+        if (!isScoStarted) return;
+
+        try {
+            Log.i(TAG, "🔇 Stopping Bluetooth SCO...");
+            audioManager.stopBluetoothSco();
+            audioManager.setBluetoothScoOn(false);
+            audioManager.setMode(AudioManager.MODE_NORMAL);
+            isScoStarted = false;
+            Log.i(TAG, "✓ SCO audio routing stopped");
+        } catch (Exception e) {
+            Log.e(TAG, "Error stopping Bluetooth SCO", e);
+        }
+    }
+
+
     private void placeCall(String number) {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -410,6 +481,7 @@ public class BluetoothServerService extends Service {
             Uri uri = Uri.fromParts("tel", number, null);
             telecomManager.placeCall(uri, new Bundle());
             Log.i(TAG, "✓ Call placed: " + number);
+            mainHandler.postDelayed(this::startBluetoothScoAudio, 2000);
         } catch (Exception e) {
             Log.e(TAG, "Error placing call", e);
         }
@@ -483,7 +555,7 @@ public class BluetoothServerService extends Service {
         } catch (Exception e) {
             Log.e(TAG, "Error unregistering receiver", e);
         }
-
+        stopBluetoothScoAudio();
         cleanupBluetooth();
         super.onDestroy();
     }
@@ -524,4 +596,57 @@ public class BluetoothServerService extends Service {
     public IBinder onBind(Intent intent) {
         return binder;
     }
+
+
+    private void testSCOAudioRouting() {
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+
+        Log.i(TAG, "🔊 Starting Bluetooth SCO Audio Routing Test...");
+
+        if (audioManager.isBluetoothScoAvailableOffCall()) {
+            Log.i(TAG, "✅ SCO is available on this device.");
+        } else {
+            Log.e(TAG, "❌ SCO not available. Your device may not support SCO outside calls.");
+            return;
+        }
+
+        audioManager.startBluetoothSco();
+        audioManager.setBluetoothScoOn(true);
+
+        Log.i(TAG, "🎧 SCO connection requested. Waiting for connection...");
+
+        // Wait a few seconds and check if SCO is connected
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            boolean scoOn = audioManager.isBluetoothScoOn();
+            if (scoOn) {
+                Log.i(TAG, "✅ SCO is now active. Audio routed through Bluetooth.");
+            } else {
+                Log.e(TAG, "❌ SCO did not activate. Trying again...");
+                audioManager.startBluetoothSco();
+            }
+        }, 4000);
+    }
+
+
+    public void registerPhoneAccount() {
+        TelecomManager telecomManager = (TelecomManager) getSystemService(Context.TELECOM_SERVICE);
+
+        ComponentName componentName = new ComponentName(
+                getPackageName(),
+                DialerService.class.getName()
+        );
+
+        PhoneAccountHandle handle = new PhoneAccountHandle(componentName, "BTBridgeAccount");
+
+        PhoneAccount phoneAccount = PhoneAccount.builder(handle, "Bluetooth Bridge Calls")
+                .setCapabilities(PhoneAccount.CAPABILITY_CALL_PROVIDER)
+                .setHighlightColor(Color.BLUE)
+                .setShortDescription("Bluetooth Bridge Dialer")
+                .build();
+
+        telecomManager.registerPhoneAccount(phoneAccount);
+
+        Log.i("DialerSetup", "✅ PhoneAccount registered successfully");
+    }
+
 }

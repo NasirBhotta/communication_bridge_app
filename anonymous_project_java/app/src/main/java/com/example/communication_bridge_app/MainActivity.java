@@ -1,13 +1,19 @@
 package com.example.communication_bridge_app;
 
 import android.Manifest;
+import android.app.Activity;
+import android.app.role.RoleManager;
 import android.bluetooth.BluetoothAdapter;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
 import android.util.Log;
+import android.widget.Button;
 import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -17,6 +23,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import com.example.btbridge.AudioTestService;
 import com.example.btbridge.BluetoothServerService;
 
 import java.util.ArrayList;
@@ -26,9 +33,17 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "MainActivity";
     private static final int PERMISSIONS_REQUEST_CODE = 123;
 
-    private final ActivityResultLauncher<Intent> requestDefaultDialerLauncher =
+    private AudioTestService audioTestService;
+
+    private final ActivityResultLauncher<Intent> requestRoleLauncher =
             registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
-                checkIfDefaultDialer();
+                if (result.getResultCode() == Activity.RESULT_OK) {
+                    Log.i(TAG, "Default Dialer role granted.");
+                    startBluetoothService();
+                } else {
+                    Log.w(TAG, "Default Dialer role not granted.");
+                    Toast.makeText(this, "Default Dialer role is required for the app to function.", Toast.LENGTH_LONG).show();
+                }
             });
 
     private final ActivityResultLauncher<Intent> enableBluetoothLauncher =
@@ -51,6 +66,14 @@ public class MainActivity extends AppCompatActivity {
         Log.i(TAG, "════════════════════════════════════");
         Log.i(TAG, "MainActivity onCreate");
         Log.i(TAG, "════════════════════════════════════");
+
+        audioTestService = new AudioTestService();
+
+        Button startAudioTestButton = findViewById(R.id.start_audio_test_button);
+        startAudioTestButton.setOnClickListener(v -> audioTestService.startAudioLoopbackTest(this));
+
+        Button stopAudioTestButton = findViewById(R.id.stop_audio_test_button);
+        stopAudioTestButton.setOnClickListener(v -> audioTestService.stopAudioLoopbackTest());
 
         checkBluetoothEnabled();
     }
@@ -103,6 +126,9 @@ public class MainActivity extends AppCompatActivity {
             permissionsToRequest.add(Manifest.permission.MANAGE_OWN_CALLS);
         }
 
+        // Audio Permission
+        permissionsToRequest.add(Manifest.permission.RECORD_AUDIO);
+
         List<String> finalPermissionsList = new ArrayList<>();
         for (String permission : permissionsToRequest) {
             if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
@@ -117,15 +143,33 @@ public class MainActivity extends AppCompatActivity {
         } else {
             Log.i(TAG, "All permissions granted");
             checkIfDefaultDialer();
+            // testPlaceCallThroughDialerService();
+
         }
     }
 
     private void checkIfDefaultDialer() {
-        // The default dialer prompt is not appearing, which prevents the service from starting.
-        // We are bypassing this check for now to allow the Bluetooth service to run.
-        // You can investigate the dialer functionality separately.
-        Log.i(TAG, "Bypassing default dialer check and starting service.");
-        startBluetoothService();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            RoleManager roleManager = getSystemService(RoleManager.class);
+            if (roleManager.isRoleHeld(RoleManager.ROLE_DIALER)) {
+                Log.i(TAG, "App is already the default dialer.");
+                startBluetoothService();
+            } else {
+                Log.i(TAG, "App is not the default dialer, requesting role...");
+                Intent intent = roleManager.createRequestRoleIntent(RoleManager.ROLE_DIALER);
+                requestRoleLauncher.launch(intent);
+            }
+        } else {
+            // For older Android versions, the original logic is kept as a fallback.
+            TelecomManager tm = (TelecomManager) getSystemService(TELECOM_SERVICE);
+            if (tm != null && getPackageName().equals(tm.getDefaultDialerPackage())) {
+                startBluetoothService();
+            } else {
+                Intent intent = new Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER)
+                        .putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, getPackageName());
+                startActivity(intent);
+            }
+        }
     }
 
     @Override
@@ -147,8 +191,7 @@ public class MainActivity extends AppCompatActivity {
             } else {
                 Log.e(TAG, "Some permissions denied: " + deniedPermissions);
                 Toast.makeText(this, "Some permissions were denied. App may not function correctly.", Toast.LENGTH_LONG).show();
-                // Try to continue anyway - some permissions might be optional
-                checkIfDefaultDialer();
+                checkIfDefaultDialer(); // Continue to dialer check even if some permissions are denied
             }
         }
     }
@@ -168,6 +211,34 @@ public class MainActivity extends AppCompatActivity {
         Toast.makeText(this, "BLE Service Started", Toast.LENGTH_SHORT).show();
         Log.i(TAG, "Service start requested");
     }
+// for testing purposes
+    private void testPlaceCallThroughDialerService() {
+        TelecomManager telecomManager = (TelecomManager) getSystemService(TELECOM_SERVICE);
+
+        Uri uri = Uri.fromParts("tel", "03123456789", null); // replace with any test number
+
+        Bundle extras = new Bundle();
+        extras.putParcelable(
+                TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE,
+                new PhoneAccountHandle(
+                        new ComponentName(getPackageName(), "com.example.btbridge.DialerService"),
+                        "BTBridgeAccount"
+                )
+        );
+
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            // TODO: Consider calling
+            //    ActivityCompat#requestPermissions
+            // here to request the missing permissions, and then overriding
+            //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
+            //                                          int[] grantResults)
+            // to handle the case where the user grants the permission. See the documentation
+            // for ActivityCompat#requestPermissions for more details.
+            return;
+        }
+        telecomManager.placeCall(uri, extras);
+        Log.i("DialerTest", "✅ Call placed via custom DialerService");
+    }
 
     @Override
     protected void onResume() {
@@ -185,5 +256,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         Log.i(TAG, "onDestroy");
         super.onDestroy();
+        if (audioTestService != null) {
+            audioTestService.stopAudioLoopbackTest();
+        }
     }
 }
